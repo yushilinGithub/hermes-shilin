@@ -21,9 +21,9 @@ from tools.file_tools import (
     _is_blocked_device,
     _invalidate_dedup_for_path,
     _READ_DEDUP_STATUS_MESSAGE,
-    _get_max_read_chars,
     _DEFAULT_MAX_READ_CHARS,
     _read_tracker,
+    notify_other_tool_call,
 )
 
 
@@ -54,6 +54,11 @@ def _make_fake_ops(content="hello\n", total_lines=1, file_size=6):
     return fake
 
 
+def _make_safe_tempdir(prefix: str) -> str:
+    """Create a temp dir outside macOS system-sensitive /private/var paths."""
+    return tempfile.mkdtemp(prefix=prefix, dir=os.getcwd())
+
+
 # ---------------------------------------------------------------------------
 # Device path blocking
 # ---------------------------------------------------------------------------
@@ -76,18 +81,79 @@ class TestDevicePathBlocking(unittest.TestCase):
         self.assertTrue(_is_blocked_device("/proc/12345/fd/2"))
 
     def test_proc_fd_other_not_blocked(self):
-        self.assertFalse(_is_blocked_device("/proc/self/fd/3"))
-        self.assertFalse(_is_blocked_device("/proc/self/maps"))
+        # The path-pattern check only blocklists /fd/0, /fd/1, /fd/2 as stdio
+        # aliases.  Higher-numbered fds are not pattern-blocked; whether they
+        # ultimately get blocked depends on realpath resolution (a separate
+        # concern, handled in test_symlink_to_blocked_device_is_blocked).
+        # Using the lower-level _is_blocked_device_path here keeps the
+        # assertion stable across environments where pytest workers happen to
+        # have fd 3 dup'd to a blocked device.
+        from tools.file_tools import _is_blocked_device_path
+
+        self.assertFalse(_is_blocked_device_path("/proc/self/fd/3"))
+
+    def test_proc_sensitive_pseudo_files_blocked(self):
+        """environ/cmdline/maps under /proc/<pid> must be blocked (issue #4427)."""
+        for path in (
+            "/proc/self/environ",
+            "/proc/12345/environ",
+            "/proc/self/cmdline",
+            "/proc/99/cmdline",
+            "/proc/self/maps",
+            "/proc/1/maps",
+        ):
+            self.assertTrue(_is_blocked_device(path), f"{path} should be blocked")
+
+    def test_proc_legitimate_files_not_blocked(self):
+        """Top-level /proc files like cpuinfo and meminfo must remain accessible."""
+        for path in ("/proc/cpuinfo", "/proc/meminfo", "/proc/uptime", "/proc/version"):
+            self.assertFalse(_is_blocked_device(path), f"{path} should not be blocked")
 
     def test_normal_files_not_blocked(self):
         self.assertFalse(_is_blocked_device("/tmp/test.py"))
         self.assertFalse(_is_blocked_device("/home/user/.bashrc"))
+
+    def test_symlink_to_blocked_device_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            link_path = os.path.join(tmpdir, "zero-link")
+            try:
+                os.symlink("/dev/zero", link_path)
+            except OSError as exc:
+                self.skipTest(f"symlink unavailable: {exc}")
+            self.assertTrue(_is_blocked_device(link_path))
+
+    def test_symlink_to_regular_file_not_blocked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = os.path.join(tmpdir, "regular.txt")
+            link_path = os.path.join(tmpdir, "regular-link")
+            with open(target_path, "w", encoding="utf-8") as handle:
+                handle.write("safe\n")
+            try:
+                os.symlink(target_path, link_path)
+            except OSError as exc:
+                self.skipTest(f"symlink unavailable: {exc}")
+            self.assertFalse(_is_blocked_device(link_path))
 
     def test_read_file_tool_rejects_device(self):
         """read_file_tool returns an error without any file I/O."""
         result = json.loads(read_file_tool("/dev/zero", task_id="dev_test"))
         self.assertIn("error", result)
         self.assertIn("device file", result["error"])
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_read_file_tool_rejects_device_symlink_before_io(self, mock_ops):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            link_path = os.path.join(tmpdir, "zero-link")
+            try:
+                os.symlink("/dev/zero", link_path)
+            except OSError as exc:
+                self.skipTest(f"symlink unavailable: {exc}")
+
+            result = json.loads(read_file_tool(link_path, task_id="dev_link_test"))
+
+        self.assertIn("error", result)
+        self.assertIn("device file", result["error"])
+        mock_ops.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +215,7 @@ class TestFileDedup(unittest.TestCase):
 
     def setUp(self):
         _read_tracker.clear()
-        self._tmpdir = tempfile.mkdtemp()
+        self._tmpdir = _make_safe_tempdir("hermes-dedup-")
         self._tmpfile = os.path.join(self._tmpdir, "dedup_test.txt")
         with open(self._tmpfile, "w") as f:
             f.write("line one\nline two\n")
@@ -292,6 +358,153 @@ class TestFileDedup(unittest.TestCase):
 
         r2 = json.loads(read_file_tool(self._tmpfile, task_id="task_b"))
         self.assertNotEqual(r2.get("dedup"), True)
+
+
+# ---------------------------------------------------------------------------
+# Dedup stub-loop guard (issue #15759)
+# ---------------------------------------------------------------------------
+
+class TestDedupStubLoopGuard(unittest.TestCase):
+    """Repeated dedup stubs must escalate to a hard BLOCKED error so weak
+    tool-following models don't burn iteration budget in an infinite loop
+    of ``read_file → stub → read_file → stub → ...``"""
+
+    def setUp(self):
+        _read_tracker.clear()
+        self._tmpdir = tempfile.mkdtemp()
+        self._tmpfile = os.path.join(self._tmpdir, "loop_test.txt")
+        with open(self._tmpfile, "w") as f:
+            f.write("line one\nline two\n")
+
+    def tearDown(self):
+        _read_tracker.clear()
+        try:
+            os.unlink(self._tmpfile)
+            os.rmdir(self._tmpdir)
+        except OSError:
+            pass
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_third_read_is_blocked(self, mock_ops):
+        """read → stub → BLOCKED.  Second stub escalates to hard error."""
+        mock_ops.return_value = _make_fake_ops(
+            content="line one\nline two\n", file_size=20,
+        )
+        # 1. Real read — full content
+        r1 = json.loads(read_file_tool(self._tmpfile, task_id="loop"))
+        self.assertNotIn("dedup", r1)
+        self.assertNotIn("error", r1)
+
+        # 2. Dedup stub (first hit)
+        r2 = json.loads(read_file_tool(self._tmpfile, task_id="loop"))
+        self.assertTrue(r2.get("dedup"))
+        self.assertNotIn("error", r2)
+
+        # 3. Dedup stub (second hit) — escalates to BLOCKED
+        r3 = json.loads(read_file_tool(self._tmpfile, task_id="loop"))
+        self.assertIn("error", r3, "Second dedup stub should be BLOCKED")
+        self.assertIn("BLOCKED", r3["error"])
+        self.assertIn("STOP", r3["error"])
+        self.assertEqual(r3.get("already_read"), 3)
+        # The loop-breaker must NOT be a dedup stub, or the model sees the
+        # same passive message it has been ignoring.
+        self.assertNotIn("dedup", r3)
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_subsequent_reads_stay_blocked(self, mock_ops):
+        """Once blocked, continued hammering keeps returning BLOCKED."""
+        mock_ops.return_value = _make_fake_ops(
+            content="line one\nline two\n", file_size=20,
+        )
+        read_file_tool(self._tmpfile, task_id="loop")  # read
+        read_file_tool(self._tmpfile, task_id="loop")  # stub
+        r3 = json.loads(read_file_tool(self._tmpfile, task_id="loop"))
+        self.assertIn("error", r3)
+        # 4th, 5th, ... calls must stay blocked, never revert to stub
+        for _ in range(5):
+            rN = json.loads(read_file_tool(self._tmpfile, task_id="loop"))
+            self.assertIn("error", rN)
+            self.assertIn("BLOCKED", rN["error"])
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_file_modification_clears_block(self, mock_ops):
+        """Real file change should break out of the block — new content
+        is legitimately different and the agent should see it."""
+        mock_ops.return_value = _make_fake_ops(
+            content="line one\nline two\n", file_size=20,
+        )
+        read_file_tool(self._tmpfile, task_id="loop")
+        read_file_tool(self._tmpfile, task_id="loop")
+        r3 = json.loads(read_file_tool(self._tmpfile, task_id="loop"))
+        self.assertIn("error", r3)
+
+        # File changes — mtime updates
+        time.sleep(0.05)
+        with open(self._tmpfile, "w") as f:
+            f.write("brand new content\n")
+
+        r4 = json.loads(read_file_tool(self._tmpfile, task_id="loop"))
+        self.assertNotIn("error", r4)
+        self.assertNotIn("dedup", r4)
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_other_tool_call_clears_hits(self, mock_ops):
+        """An intervening non-read tool call resets stub-hit counters,
+        just like it resets the consecutive-read counter."""
+        mock_ops.return_value = _make_fake_ops(
+            content="line one\nline two\n", file_size=20,
+        )
+        read_file_tool(self._tmpfile, task_id="loop")
+        read_file_tool(self._tmpfile, task_id="loop")  # 1st stub
+
+        # Agent did something else — e.g. terminal, write_file — so the
+        # stub-loop is broken.  Counter should reset.
+        notify_other_tool_call("loop")
+
+        r3 = json.loads(read_file_tool(self._tmpfile, task_id="loop"))
+        # Should be a stub again, NOT blocked
+        self.assertTrue(r3.get("dedup"))
+        self.assertNotIn("error", r3)
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_different_ranges_tracked_independently(self, mock_ops):
+        """Stub-hit counter is keyed by (path, offset, limit), so hammering
+        one range shouldn't block reads of a different range."""
+        mock_ops.return_value = _make_fake_ops(
+            content="line one\nline two\n", file_size=20,
+        )
+        # Burn down one range
+        read_file_tool(self._tmpfile, offset=1, limit=100, task_id="loop")
+        read_file_tool(self._tmpfile, offset=1, limit=100, task_id="loop")
+        r3 = json.loads(read_file_tool(
+            self._tmpfile, offset=1, limit=100, task_id="loop",
+        ))
+        self.assertIn("error", r3)
+
+        # Different range — fresh read, should go through
+        r_other = json.loads(read_file_tool(
+            self._tmpfile, offset=1, limit=200, task_id="loop",
+        ))
+        self.assertNotIn("error", r_other)
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_reset_file_dedup_clears_hits(self, mock_ops):
+        """Post-compression reset must clear stub-hit counters too,
+        otherwise the agent stays blocked after compression."""
+        mock_ops.return_value = _make_fake_ops(
+            content="line one\nline two\n", file_size=20,
+        )
+        read_file_tool(self._tmpfile, task_id="loop")
+        read_file_tool(self._tmpfile, task_id="loop")
+        r3 = json.loads(read_file_tool(self._tmpfile, task_id="loop"))
+        self.assertIn("error", r3)
+
+        reset_file_dedup("loop")
+
+        # Fresh session — real read, no stub, no block
+        r4 = json.loads(read_file_tool(self._tmpfile, task_id="loop"))
+        self.assertNotIn("error", r4)
+        self.assertNotIn("dedup", r4)
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +680,7 @@ class TestWriteInvalidatesDedup(unittest.TestCase):
 
     def setUp(self):
         _read_tracker.clear()
-        self._tmpdir = tempfile.mkdtemp()
+        self._tmpdir = _make_safe_tempdir("hermes-write-dedup-")
         self._tmpfile = os.path.join(self._tmpdir, "write_dedup.txt")
         with open(self._tmpfile, "w") as f:
             f.write("original content\n")
