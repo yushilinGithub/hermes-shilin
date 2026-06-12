@@ -2,12 +2,12 @@ import type { MutableRefObject } from 'react'
 import { useCallback, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import { deleteSession, getSessionMessages, listAllProfileSessions, setSessionArchived } from '@/hermes'
+import { useI18n } from '@/i18n'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { setSessionYolo } from '@/lib/yolo-session'
-import { clearComposerAttachments, clearComposerDraft } from '@/store/composer'
 import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
@@ -18,7 +18,6 @@ import {
   $messages,
   $sessions,
   $yoloActive,
-  getRememberedWorkspaceCwd,
   sessionPinId,
   setActiveSessionId,
   setAwaitingResponse,
@@ -40,10 +39,11 @@ import {
   setSessionStartedAt,
   setSessionsTotal,
   setTurnStartedAt,
-  setYoloActive
+  setYoloActive,
+  workspaceCwdForNewSession
 } from '@/store/session'
 import { reportBackendContract } from '@/store/updates'
-import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, UsageStats } from '@/types/hermes'
+import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo, UsageStats } from '@/types/hermes'
 
 import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../types'
@@ -209,14 +209,67 @@ function patchSessionWorkspace(sessionId: string, cwd: string | undefined) {
   setSessions(prev => prev.map(session => (session.id === sessionId ? { ...session, cwd } : session)))
 }
 
-function applyRuntimeInfo(
-  info: SessionCreateResponse['info'] | undefined
-): Partial<Pick<ClientSessionState, 'branch' | 'cwd'>> | null {
+function sessionMatchesStoredId(session: SessionInfo, storedSessionId: string): boolean {
+  return session.id === storedSessionId || session._lineage_root_id === storedSessionId
+}
+
+function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
+  const lineage = session._lineage_root_id ?? session.id
+
+  setSessions(prev => [
+    session,
+    ...prev.filter(existing => {
+      if (sessionMatchesStoredId(existing, storedSessionId)) {
+        return false
+      }
+
+      return (existing._lineage_root_id ?? existing.id) !== lineage
+    })
+  ])
+}
+
+async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
+  const cached = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+
+  if (cached) {
+    return cached
+  }
+
+  try {
+    const result = await listAllProfileSessions(500, 0, 'include', 'recent', 'all')
+    const resolved = result.sessions.find(session => sessionMatchesStoredId(session, storedSessionId))
+
+    if (resolved) {
+      upsertResolvedSession(resolved, storedSessionId)
+    }
+
+    return resolved
+  } catch {
+    return undefined
+  }
+}
+
+type SessionRuntimeStatePatch = Partial<
+  Pick<
+    ClientSessionState,
+    | 'branch'
+    | 'cwd'
+    | 'fast'
+    | 'model'
+    | 'personality'
+    | 'provider'
+    | 'reasoningEffort'
+    | 'serviceTier'
+    | 'yolo'
+  >
+>
+
+function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionRuntimeStatePatch | null {
   if (!info) {
     return null
   }
 
-  const sessionState: Partial<Pick<ClientSessionState, 'branch' | 'cwd'>> = {}
+  const sessionState: SessionRuntimeStatePatch = {}
 
   reportBackendContract(info.desktop_contract)
 
@@ -224,12 +277,14 @@ function applyRuntimeInfo(
     requestDesktopOnboarding(info.credential_warning)
   }
 
-  if (info.model) {
+  if (typeof info.model === 'string') {
     setCurrentModel(info.model)
+    sessionState.model = info.model
   }
 
-  if (info.provider) {
+  if (typeof info.provider === 'string') {
     setCurrentProvider(info.provider)
+    sessionState.provider = info.provider
   }
 
   if (info.cwd) {
@@ -243,23 +298,29 @@ function applyRuntimeInfo(
   }
 
   if (typeof info.personality === 'string') {
-    setCurrentPersonality(normalizePersonalityValue(info.personality))
+    const personality = normalizePersonalityValue(info.personality)
+    setCurrentPersonality(personality)
+    sessionState.personality = personality
   }
 
   if (typeof info.reasoning_effort === 'string') {
     setCurrentReasoningEffort(info.reasoning_effort)
+    sessionState.reasoningEffort = info.reasoning_effort
   }
 
   if (typeof info.service_tier === 'string') {
     setCurrentServiceTier(info.service_tier)
+    sessionState.serviceTier = info.service_tier
   }
 
   if (typeof info.fast === 'boolean') {
     setCurrentFastMode(info.fast)
+    sessionState.fast = info.fast
   }
 
   if (typeof info.yolo === 'boolean') {
     setYoloActive(info.yolo)
+    sessionState.yolo = info.yolo
   }
 
   if (info.usage) {
@@ -267,6 +328,16 @@ function applyRuntimeInfo(
   }
 
   return sessionState
+}
+
+function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | string } | undefined) {
+  setCurrentModel(stored?.model || '')
+  setCurrentProvider('')
+  setCurrentReasoningEffort('')
+  setCurrentServiceTier('')
+  setCurrentFastMode(false)
+  setYoloActive(false)
+  setCurrentPersonality('')
 }
 
 export function useSessionActions({
@@ -285,6 +356,8 @@ export function useSessionActions({
   syncSessionStateToView,
   updateSessionState
 }: SessionActionsOptions) {
+  const { t } = useI18n()
+  const copy = t.desktop
   const resumeRequestRef = useRef(0)
 
   const startFreshSessionDraft = useCallback(
@@ -308,11 +381,17 @@ export function useSessionActions({
       })
       setSessionStartedAt(null)
       setTurnStartedAt(null)
-      // New chats inherit the current workspace.
-      setCurrentCwd(getRememberedWorkspaceCwd())
+      // New chats start in the configured default project dir when set,
+      // otherwise the sticky last-used workspace (PR #37586).
+      setCurrentModel('')
+      setCurrentProvider('')
+      setCurrentReasoningEffort('')
+      setCurrentServiceTier('')
+      setCurrentFastMode(false)
+      setYoloActive(false)
+      setCurrentCwd(workspaceCwdForNewSession())
       setCurrentBranch('')
-      clearComposerDraft()
-      clearComposerAttachments()
+      // Never clear the composer here — ChatBar's per-thread draft swap owns it.
       setFreshDraftReady(true)
     },
     [activeSessionIdRef, busyRef, navigate, selectedStoredSessionIdRef]
@@ -330,15 +409,17 @@ export function useSessionActions({
         // Route the new chat to the chosen profile's backend (null = primary,
         // so single-profile users are unaffected).
         await ensureGatewayProfile($newChatProfile.get())
-        const cwd = $currentCwd.get().trim() || getRememberedWorkspaceCwd()
+        const cwd = $currentCwd.get().trim() || workspaceCwdForNewSession()
         // Pass the owning profile so a new chat under a non-launch profile (global
         // remote mode) builds its agent + persists against THAT profile's home/db.
         const newChatProfile = $newChatProfile.get()
+
         const created = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
           ...(cwd && { cwd }),
           ...(newChatProfile ? { profile: newChatProfile } : {})
         })
+
         const stored = created.stored_session_id ?? null
 
         if (
@@ -439,26 +520,42 @@ export function useSessionActions({
 
       // Swap the single live gateway to this session's profile before any
       // gateway call (no-op when it's already on that profile / single-profile).
-      const storedForProfile = $sessions.get().find(session => session.id === storedSessionId)
+      const storedForProfile = await resolveStoredSession(storedSessionId)
       const sessionProfile = storedForProfile?.profile
+
+      if (resumeRequestRef.current !== requestId) {
+        return
+      }
+
       await ensureGatewayProfile(sessionProfile)
 
       const cachedRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
       const cachedState = cachedRuntimeId && sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)
 
       if (cachedRuntimeId && cachedState) {
+        const stored = $sessions.get().find(session => session.id === storedSessionId)
+        const cachedViewState =
+          !cachedState.model && stored?.model != null
+            ? {
+                ...cachedState,
+                model: stored.model || ''
+              }
+            : cachedState
+
+        if (cachedViewState !== cachedState) {
+          sessionStateByRuntimeIdRef.current.set(cachedRuntimeId, cachedViewState)
+        }
+
         setFreshDraftReady(false)
         clearNotifications()
         setSelectedStoredSessionId(storedSessionId)
         selectedStoredSessionIdRef.current = storedSessionId
         setActiveSessionId(cachedRuntimeId)
         activeSessionIdRef.current = cachedRuntimeId
-        syncSessionStateToView(cachedRuntimeId, cachedState)
-        setCurrentCwd(cachedState.cwd)
-        setCurrentBranch(cachedState.branch)
+        syncSessionStateToView(cachedRuntimeId, cachedViewState)
+        setCurrentCwd(cachedViewState.cwd)
+        setCurrentBranch(cachedViewState.branch)
         setSessionStartedAt(Date.now())
-        clearComposerDraft()
-        clearComposerAttachments()
 
         try {
           const usage = await requestGateway<UsageStats>('session.usage', { session_id: cachedRuntimeId })
@@ -497,7 +594,8 @@ export function useSessionActions({
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
       setSessionStartedAt(Date.now())
-      const stored = $sessions.get().find(session => session.id === storedSessionId)
+      const stored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+      applyStoredSessionPreviewRuntimeInfo(stored)
 
       if (stored) {
         setCurrentUsage(current => ({
@@ -588,8 +686,6 @@ export function useSessionActions({
           }),
           storedSessionId
         )
-        clearComposerDraft()
-        clearComposerAttachments()
       } catch (err) {
         if (!isCurrentResume()) {
           return
@@ -602,7 +698,7 @@ export function useSessionActions({
         }
 
         setMessages(preserveLocalAssistantErrors(toChatMessages(fallback.messages), $messages.get()))
-        notifyError(err, 'Resume failed')
+        notifyError(err, copy.resumeFailed)
       } finally {
         if (isCurrentResume()) {
           busyRef.current = false
@@ -614,6 +710,7 @@ export function useSessionActions({
     [
       activeSessionIdRef,
       busyRef,
+      copy,
       requestGateway,
       runtimeIdByStoredSessionIdRef,
       selectedStoredSessionIdRef,
@@ -630,8 +727,8 @@ export function useSessionActions({
       if (!sourceSessionId) {
         notify({
           kind: 'warning',
-          title: 'Nothing to branch',
-          message: 'Start or resume a chat before branching.'
+          title: copy.nothingToBranch,
+          message: copy.branchNeedsChat
         })
 
         return false
@@ -640,8 +737,8 @@ export function useSessionActions({
       if (busyRef.current) {
         notify({
           kind: 'warning',
-          title: 'Session busy',
-          message: 'Stop the current turn before branching this chat.'
+          title: copy.sessionBusy,
+          message: copy.branchStopCurrent
         })
 
         return false
@@ -671,8 +768,8 @@ export function useSessionActions({
         if (!branchMessages.length) {
           notify({
             kind: 'warning',
-            title: 'Nothing to branch',
-            message: 'This message has no text to branch from.'
+            title: copy.nothingToBranch,
+            message: copy.branchNoText
           })
 
           return false
@@ -686,14 +783,14 @@ export function useSessionActions({
           cols: 96,
           ...(cwd && { cwd }),
           messages: branchMessages.map(({ content, role }) => ({ content, role })),
-          title: 'Branch'
+          title: copy.branchTitle
         })
 
         const routedSessionId = branched.stored_session_id ?? branched.session_id
         const preview = branchMessages.map(({ content }) => content).find(Boolean) ?? null
 
         setFreshDraftReady(false)
-        upsertOptimisticSession(branched, routedSessionId, 'Branch', preview)
+        upsertOptimisticSession(branched, routedSessionId, copy.branchTitle, preview)
         ensureSessionState(branched.session_id, routedSessionId)
         setActiveSessionId(branched.session_id)
         activeSessionIdRef.current = branched.session_id
@@ -711,8 +808,6 @@ export function useSessionActions({
         selectedStoredSessionIdRef.current = routedSessionId
         navigate(sessionRoute(routedSessionId))
 
-        clearComposerDraft()
-        clearComposerAttachments()
         const runtimeInfo = applyRuntimeInfo(branched.info)
 
         patchSessionWorkspace(routedSessionId, runtimeInfo?.cwd)
@@ -723,7 +818,7 @@ export function useSessionActions({
 
         return true
       } catch (err) {
-        notifyError(err, 'Branch failed')
+        notifyError(err, copy.branchFailed)
 
         return false
       } finally {
@@ -735,6 +830,7 @@ export function useSessionActions({
     [
       activeSessionIdRef,
       busyRef,
+      copy,
       creatingSessionRef,
       ensureSessionState,
       navigate,
@@ -748,7 +844,7 @@ export function useSessionActions({
     async (storedSessionId: string) => {
       clearNotifications()
 
-      const removed = $sessions.get().find(s => s.id === storedSessionId)
+      const removed = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
@@ -757,7 +853,7 @@ export function useSessionActions({
       // live tip after compression. Drop both so the pin can't linger.
       const removedPinId = removed ? sessionPinId(removed) : storedSessionId
 
-      setSessions(prev => prev.filter(s => s.id !== storedSessionId))
+      setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       // Keep $sessionsTotal in sync so the sidebar's "Load N more" footer
       // doesn't keep claiming the removed row is still on the server.
       setSessionsTotal(prev => Math.max(0, prev - 1))
@@ -792,7 +888,7 @@ export function useSessionActions({
           setFreshDraftReady(false)
           setSelectedStoredSessionId(storedSessionId)
           selectedStoredSessionIdRef.current = storedSessionId
-          const stored = $sessions.get().find(session => session.id === storedSessionId)
+          const stored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
 
           if (stored) {
             setCurrentUsage(current => ({
@@ -812,12 +908,13 @@ export function useSessionActions({
           }
         }
 
-        notifyError(err, 'Delete failed')
+        notifyError(err, copy.deleteFailed)
       }
     },
     [
       activeSessionId,
       activeSessionIdRef,
+      copy,
       navigate,
       requestGateway,
       selectedStoredSessionId,
@@ -830,7 +927,7 @@ export function useSessionActions({
     async (storedSessionId: string) => {
       clearNotifications()
 
-      const archived = $sessions.get().find(s => s.id === storedSessionId)
+      const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
       const wasSelected = selectedStoredSessionId === storedSessionId
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
@@ -838,7 +935,7 @@ export function useSessionActions({
       const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
 
       // Soft-hide: drop from the sidebar immediately, keep the data.
-      setSessions(prev => prev.filter(s => s.id !== storedSessionId))
+      setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       // Archived sessions are hidden by the listSessions(min_messages=1) query
       // on the next refresh, so they count as "removed" for the load-more
       // footer math.
@@ -851,18 +948,24 @@ export function useSessionActions({
 
       try {
         await setSessionArchived(storedSessionId, true, archived?.profile)
-        notify({ durationMs: 2_000, kind: 'success', message: 'Archived' })
+        // A sidebar refresh can race the optimistic removal while the PATCH is
+        // in flight and briefly reinsert the still-unarchived backend row. Win
+        // that race after the mutation succeeds so right-click → Archive does
+        // not appear to do nothing until the next full refresh.
+        setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+        $pinnedSessionIds.set($pinnedSessionIds.get().filter(id => id !== storedSessionId && id !== archivedPinId))
+        notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
       } catch (err) {
         if (archived) {
-          setSessions(prev => [archived, ...prev.filter(s => s.id !== storedSessionId)])
+          setSessions(prev => [archived, ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))])
           setSessionsTotal(prev => prev + 1)
         }
 
         $pinnedSessionIds.set(previousPinned)
-        notifyError(err, 'Archive failed')
+        notifyError(err, copy.archiveFailed)
       }
     },
-    [selectedStoredSessionId, startFreshSessionDraft]
+    [copy, selectedStoredSessionId, startFreshSessionDraft]
   )
 
   return {
