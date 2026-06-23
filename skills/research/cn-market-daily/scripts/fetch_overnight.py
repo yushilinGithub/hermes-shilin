@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """Fetch overnight inputs that drive the next China A-share / HK-tech session.
 
-Dependency-light: uses only `requests` against Yahoo Finance's free public JSON
-chart API (no API key, no pandas/yfinance). Prints a compact human-readable
-block AND a machine-readable JSON blob so the agent can synthesize a pre-market
-brief. All times surfaced are the source's; run this ~07:30 CST.
+CHINA-NATIVE: uses AkShare against **sina** sources, which are reachable from
+mainland China (where Yahoo Finance is blocked). The previous Yahoo/`requests`
+implementation is gone — it does not work on a China-hosted deployment.
 
-This is a Phase-1 MVP fetcher. The A-share breadth/margin/flows layer
-(AkShare-based) is added in Phase 2 as fetch_a_share.py.
+Sina daily series return the *previous* US session's close, which at ~07:30 CST
+is exactly last night's close — the overnight read we want.
+
+Pulls (all sina, work in CN and abroad):
+  • US indices: Nasdaq / S&P 500 / PHLX Semiconductor (SOX) — index_us_stock_sina
+  • China ADRs: KWEB / CQQQ / FXI (overnight China sentiment + implied direction)
+  • USD/CNY — fx_spot_quote
+
+Dropped vs the old Yahoo version: US 10Y (akshare source is stale), DXY (not in
+sina fx), FTSE A50 futures (no clean CN source — FXI ADR is the overnight
+China-direction proxy instead).
 
 Usage:
     python3 fetch_overnight.py            # pretty + JSON
@@ -15,131 +23,129 @@ Usage:
 """
 from __future__ import annotations
 
+import datetime as dt
+import io
 import json
 import sys
-import time
-from typing import Any, Dict, Optional
+from contextlib import redirect_stderr
+from typing import Any, Callable, Dict, Optional
 
-import requests
+import akshare as ak
 
-# Symbol -> (label, group). Yahoo tickers; A50/ADRs included as leading tells.
-SYMBOLS: Dict[str, tuple[str, str]] = {
-    "^IXIC": ("Nasdaq Composite", "US equity"),
-    "^GSPC": ("S&P 500", "US equity"),
-    "^SOX": ("PHLX Semiconductor (SOX)", "US tech lead"),
-    "^TNX": ("US 10Y yield (%)", "rates"),
-    "DX-Y.NYB": ("US Dollar Index (DXY)", "fx"),
-    "CNY=X": ("USD/CNY", "fx"),
-    "CNH=X": ("USD/CNH (offshore)", "fx"),
-    "CL=F": ("WTI crude", "commodity"),
-    "GC=F": ("Gold", "commodity"),
-    "XIN9.FGI": ("FTSE China A50 futures", "A-share lead"),
-    "KWEB": ("KraneShares China Internet ETF", "China-tech ADR"),
-    "CQQQ": ("Invesco China Tech ETF", "China-tech ADR"),
-    "FXI": ("iShares China Large-Cap ETF", "China large-cap ADR"),
+# sina symbol -> label
+US_INDICES = {
+    ".IXIC": "Nasdaq Composite",
+    ".INX": "S&P 500",
+    ".SOX": "PHLX Semiconductor (SOX)",
+}
+ADRS = {
+    "KWEB": "KraneShares China Internet ETF",
+    "CQQQ": "Invesco China Tech ETF",
+    "FXI": "iShares China Large-Cap ETF",
 }
 
-YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-HEADERS = {"User-Agent": "Mozilla/5.0 (cn-market-daily/0.1)"}
 
-
-def fetch_one(sym: str, attempts: int = 3) -> Optional[Dict[str, Any]]:
-    """Return last price + % change vs previous close, or None on failure.
-
-    Retries a few times with backoff — Yahoo's free endpoint intermittently
-    throttles/drops connections, so a single miss shouldn't blank a symbol.
-    """
-    last_exc = "no data"
-    for attempt in range(attempts):
+def _try(fn: Callable[[], Any], attempts: int = 3) -> tuple[Optional[Any], Optional[str]]:
+    """Run fn with retries, swallowing AkShare's stderr tqdm noise."""
+    err = "unavailable"
+    for _ in range(attempts):
         try:
-            r = requests.get(
-                YF_CHART.format(sym=sym),
-                params={"range": "5d", "interval": "1d"},
-                headers=HEADERS,
-                timeout=10,
-            )
-            r.raise_for_status()
-            return _parse_chart(sym, r.json())
-        except Exception as exc:  # noqa: BLE001 — best-effort fetch, never crash the brief
-            last_exc = str(exc)[:120]
-            time.sleep(0.5 * (attempt + 1))
-    return {"symbol": sym, "error": last_exc}
+            with redirect_stderr(io.StringIO()):
+                return fn(), None
+        except Exception as exc:  # noqa: BLE001 — best-effort, never crash the brief
+            err = repr(exc)[:110]
+    return None, err
 
 
-def _parse_chart(sym: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Parse a Yahoo chart payload into last/prev/change_pct."""
-    try:
-        result = payload["chart"]["result"][0]
-        meta = result["meta"]
-
-        # Compute a TRUE 1-session change from the actual daily close series.
-        # meta.chartPreviousClose is the close *before the range starts*, so
-        # using it would span multiple days for some symbols (the bug that made
-        # KWEB and CQQQ diverge). Take the last two non-null daily closes; fall
-        # back to meta only if the series is unusable.
-        closes = []
-        try:
-            closes = [c for c in result["indicators"]["quote"][0]["close"] if c is not None]
-        except (KeyError, IndexError, TypeError):
-            closes = []
-
-        last = meta.get("regularMarketPrice")
-        if len(closes) >= 2:
-            last = closes[-1] if last is None else last
-            prev = closes[-2]
-        else:
-            prev = meta.get("chartPreviousClose") or meta.get("previousClose")
-
-        if last is None or prev in (None, 0):
-            return None
-        pct = (last - prev) / prev * 100.0
-        return {
-            "symbol": sym,
-            "last": round(last, 4),
-            "prev_close": round(prev, 4),
-            "change_pct": round(pct, 2),
-        }
-    except Exception:  # noqa: BLE001 — malformed payload -> let caller mark it missing
+def _pct_from_daily(df: Any) -> Optional[Dict[str, Any]]:
+    """Last close + 1-session % change from a daily OHLC dataframe."""
+    if df is None or df.empty or "close" not in df.columns:
         return None
+    closes = [float(c) for c in df["close"].tolist() if c is not None]
+    if len(closes) < 2:
+        return None
+    last, prev = closes[-1], closes[-2]
+    if prev == 0:
+        return None
+    return {
+        "last": round(last, 4),
+        "prev_close": round(prev, 4),
+        "change_pct": round((last - prev) / prev * 100.0, 2),
+    }
+
+
+def get_us_indices() -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for sym, label in US_INDICES.items():
+        df, err = _try(lambda s=sym: ak.index_us_stock_sina(symbol=s))
+        parsed = _pct_from_daily(df)
+        out[sym] = {"label": label, **parsed} if parsed else {"label": label, "error": err or "no data"}
+    return out
+
+
+def get_adrs() -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for sym, label in ADRS.items():
+        df, err = _try(lambda s=sym: ak.stock_us_daily(symbol=s))
+        parsed = _pct_from_daily(df)
+        out[sym] = {"label": label, **parsed} if parsed else {"label": label, "error": err or "no data"}
+    return out
+
+
+def get_usdcny() -> Dict[str, Any]:
+    df, err = _try(ak.fx_spot_quote)
+    if df is None:
+        return {"error": err}
+    row = df[df["货币对"] == "USD/CNY"]
+    if row.empty:
+        return {"error": "USD/CNY not in feed"}
+    bid = float(row.iloc[0]["买报价"])
+    ask = float(row.iloc[0]["卖报价"])
+    return {"label": "USD/CNY", "mid": round((bid + ask) / 2, 4)}
 
 
 def main() -> int:
     json_only = "--json" in sys.argv
-    out: Dict[str, Any] = {"generated_unix": int(time.time()), "instruments": {}}
-
-    for sym, (label, group) in SYMBOLS.items():
-        data = fetch_one(sym)
-        if data is None:
-            data = {"symbol": sym, "error": "no data"}
-        data["label"] = label
-        data["group"] = group
-        out["instruments"][sym] = data
-        time.sleep(0.15)  # be gentle on the free endpoint
+    out = {
+        "generated": dt.datetime.now().isoformat(timespec="seconds"),
+        "us_indices": get_us_indices(),
+        "china_adrs": get_adrs(),
+        "usdcny": get_usdcny(),
+    }
 
     if not json_only:
         print("=" * 60)
-        print("OVERNIGHT INPUTS — China pre-market read")
+        print("OVERNIGHT INPUTS — China pre-market read (sina / CN-accessible)")
         print("=" * 60)
-        last_group = None
-        for sym, d in out["instruments"].items():
-            if d.get("group") != last_group:
-                last_group = d.get("group")
-                print(f"\n[{last_group}]")
+
+        print("\n[US indices — last session]")
+        for d in out["us_indices"].values():
             if "error" in d:
-                print(f"  {d['label']:<34} —  (fetch failed: {d['error']})")
+                print(f"  {d['label']:<34} — (unavailable)")
             else:
-                arrow = "▲" if d["change_pct"] >= 0 else "▼"
-                print(f"  {d['label']:<34} {d['last']:>12}  {arrow} {d['change_pct']:+.2f}%")
+                a = "▲" if d["change_pct"] >= 0 else "▼"
+                print(f"  {d['label']:<34} {d['last']:>12}  {a} {d['change_pct']:+.2f}%")
+
+        print("\n[China ADRs — overnight sentiment]")
+        for d in out["china_adrs"].values():
+            if "error" in d:
+                print(f"  {d['label']:<34} — (unavailable)")
+            else:
+                a = "▲" if d["change_pct"] >= 0 else "▼"
+                print(f"  {d['label']:<34} {d['last']:>12}  {a} {d['change_pct']:+.2f}%")
+
+        u = out["usdcny"]
+        print(f"\n[FX] USD/CNY {u.get('mid', 'unavailable')}")
+
         print("\n" + "-" * 60)
         print("Reading guide:")
         print("  • SOX / Nasdaq down hard  -> ChiNext/STAR & CSI 1000 most at risk")
-        print("  • FTSE A50 futures        -> implied direction for the 09:30 CST open")
-        print("  • KWEB/CQQQ/FXI           -> overnight China sentiment (ADR proxy)")
-        print("  • USD/CNH up + 10Y up     -> foreign risk-off pressure on A-shares")
-        print("-" * 60 + "\n")
-        print("JSON:")
+        print("  • FXI (China large-cap ADR) -> best overnight proxy for the A-share open")
+        print("  • KWEB / CQQQ             -> China-tech sentiment read")
+        print("  • USD/CNY up              -> foreign risk-off / capital-outflow pressure")
+        print("-" * 60 + "\nJSON:")
 
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
     return 0
 
 

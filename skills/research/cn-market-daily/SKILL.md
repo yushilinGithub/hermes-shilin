@@ -41,14 +41,15 @@ The analytical core lives in two references — **read the relevant one fully be
 ### 1. Pre-market brief — run ~07:30 CST
 
 ```bash
-python3 skills/research/cn-market-daily/scripts/fetch_overnight.py            # overnight US/ADR/A50
+python3 skills/research/cn-market-daily/scripts/fetch_overnight.py            # overnight US/ADR/FX
 python3 skills/research/cn-market-daily/scripts/fetch_a_share.py --levels-only # REAL A-share anchor levels
 ```
 
-The first pulls overnight inputs (US close, semis/Mag-7 proxy, 10Y yield, USD/CNY,
-oil/gold, FTSE China A50 futures, KWEB/CQQQ ADRs) via Yahoo's free JSON API. The second
-gives each index's prior close + 20-day swing high/low from sina — **use these as the key
-levels; never guess index levels** (fetch_overnight has no A-share level source). Then:
+The first pulls overnight inputs (US indices: Nasdaq/S&P/SOX; China ADRs: KWEB/CQQQ/FXI;
+USD/CNY) via **AkShare sina** sources — China-accessible (Yahoo is blocked in mainland
+China). The second gives each index's prior close + 20-day swing high/low from sina —
+**use these as the key levels; never guess index levels** (fetch_overnight has no A-share
+level source). Then:
 
 1. Read `references/drivers.md` + `references/index-playbooks.md`.
 2. Web-search for any overnight China policy/regulatory headlines and the day's scheduled
@@ -96,9 +97,10 @@ deliberately prefers reachable sources and degrades gracefully (a failed block i
 | Levels | `stock_zh_index_daily` (sina; may lag intraday near close) | ✅ |
 | Main-force fund flow | `stock_market_fund_flow` (eastmoney) | ⚠️ often fails off-CN |
 
-If you run the agent on a China VPS (recommended for live trading use), the eastmoney
-sources become reliable and you can re-enable `*_em` variants for richer sector flows.
-`fetch_overnight.py` (US/ADR/A50) uses Yahoo and is reachable everywhere.
+`fetch_overnight.py` now uses **AkShare sina** sources (US indices, China ADRs, USD/CNY),
+which work both in mainland China and abroad — Yahoo is no longer used (it is blocked in
+China). On a China-hosted deployment the eastmoney (`*_em`) sources in `fetch_a_share.py`
+also become reliable, so the whole stack is healthiest when run from inside China.
 
 ## Output discipline
 
