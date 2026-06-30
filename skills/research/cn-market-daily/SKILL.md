@@ -42,14 +42,22 @@ The analytical core lives in two references — **read the relevant one fully be
 
 ```bash
 python3 skills/research/cn-market-daily/scripts/fetch_overnight.py            # overnight US/ADR/FX
+python3 skills/research/cn-market-daily/scripts/fetch_cross_index_dashboard.py # 4-index 1d/5d/1mo/YTD cross-bloc view
 python3 skills/research/cn-market-daily/scripts/fetch_a_share.py --levels-only # REAL A-share anchor levels
 ```
 
 The first pulls overnight inputs (US indices: Nasdaq/S&P/SOX; China ADRs: KWEB/CQQQ/FXI;
 USD/CNY) via **AkShare sina** sources — China-accessible (Yahoo is blocked in mainland
-China). The second gives each index's prior close + 20-day swing high/low from sina —
-**use these as the key levels; never guess index levels** (fetch_overnight has no A-share
-level source). Then:
+China). The second gives the multi-window cross-bloc picture for the four ETF-tracked
+indices (S&P 500, Nasdaq 100, CSI 300, Hang Seng Tech) — 1d/5d/1mo/YTD — surfacing the
+divergences that drive positioning: broad-vs-AI-led in the US, and onshore-vs-offshore in
+China (CSI 300 vs Hang Seng Tech). It uses **yfinance** (the server can reach Yahoo) — the
+exception to this skill's CN-native rule — which buys back the macro gauges no CN source
+serves reliably: US 10Y, DXY, VIX, plus Nvidia, USD/CNY and WTI. Hang Seng Tech is proxied
+by the 3032.HK ETF (no native Yahoo index symbol); if Yahoo access regresses, fall back to
+the sina symbols (.INX/.NDX/sh000300/HSTECH). The third gives each index's
+prior close + 20-day swing high/low from sina — **use these as the key levels; never guess
+index levels** (fetch_overnight has no A-share level source). Then:
 
 1. Read `references/drivers.md` + `references/index-playbooks.md`.
 2. Web-search for any overnight China policy/regulatory headlines and the day's scheduled
@@ -114,6 +122,7 @@ also become reliable, so the whole stack is healthiest when run from inside Chin
 
 - [x] Phase 1 (MVP): skill + drivers + playbooks + `fetch_overnight.py` + pre-market template, CLI output.
 - [x] Phase 2: AkShare A-share fetcher (`fetch_a_share.py`) + post-close template + self-scoring (`score_yesterday.py`).
+- [x] Cross-bloc dashboard (`fetch_cross_index_dashboard.py`): 4 ETF-tracked indices (S&P 500, Nasdaq 100, CSI 300, Hang Seng Tech) + macro row (10Y/DXY/VIX/NVDA/USD-CNY/WTI), 1d/5d/1mo/YTD via yfinance (server now reaches Yahoo), per-symbol fallback for batch drops, wired into the pre-market step.
 - [ ] Phase 3: cron schedule (07:30 + 15:30 CST) + Telegram delivery via gateway.
 
 Phase 2 requires `akshare` in the env: `uv pip install akshare` (already installed in `.venv`).
